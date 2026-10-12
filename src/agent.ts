@@ -1,14 +1,33 @@
 import { setTraceOutput, span } from 'neatlogs';
 import { config } from './config.js';
 import { getTracedLlmClient } from './llm.js';
-import { analyzeRepo, getLatestRunStatus, inspectRepo, mapRepo, type RepoAnalysis, type RepoFacts, type RepoMap, type RunStatus } from './github.js';
+import { analyzeRepo, getLatestRunStatus, inspectRepo, listRunArtifacts, mapRepo, pushPatchToBranch, readRepoFile, triggerAndWatch, type RepoAnalysis, type RepoFacts, type RepoMap, type RunStatus } from './github.js';
+import { generateWorkflowPatch } from './patch.js';
 import { investigateWithPi, type PiInvestigation } from './pi-loop.js';
 import { FIXTURE_NODE_LOG, matchPlaybook, tailLines } from './playbook.js';
+import { readAgentHistory, type AgentHistory } from './history.js';
 
 export interface FixInput {
   repoUrl: string;
   goal: string;
   logTail: string;
+  /** False = dry-run (generate patch only). True = push branch + trigger + watch. */
+  apply: boolean;
+}
+
+export interface AppliedPatch {
+  path: string;
+  summary: string;
+  changed: boolean;
+  attempts: number;
+  verified: boolean;
+  verifyNotes: string[];
+  branch: string | null;
+  commitSha: string | null;
+  triggeredRunId: number | null;
+  triggeredRunUrl: string;
+  triggeredConclusion: string | null;
+  watchTimedOut: boolean;
 }
 
 export interface FixResult {
@@ -25,6 +44,11 @@ export interface FixResult {
   run: RunStatus | null;
   map: RepoMap | null;
   logSource: 'cli' | 'run' | 'fixture' | 'none';
+  applied: boolean;
+  patch: AppliedPatch | null;
+  rounds: FixRound[];
+  /** What the agent learned from its own Neatlogs traces (or why unavailable). */
+  history: string;
 }
 
 const isAnalysisGoal = (goal: string): boolean =>
@@ -116,6 +140,28 @@ const narrateStep = span(
   },
 );
 
+export interface FixRound {
+  n: number;
+  branch: string;
+  patchSummary: string;
+  triggeredRunId: number;
+  triggeredRunUrl: string;
+  conclusion: string | null;
+  artifacts: string[];
+  artifactFound: boolean;
+  verified: boolean;
+  logSource: string;
+}
+
+const MAX_FIX_ITERS = 3;
+
+/** The agent reading its own Neatlogs traces before acting. Degrades to a
+ * labeled gap when read credentials are absent (human-gated). */
+const reflectStep = span(
+  { kind: 'AGENT', name: 'reflect' },
+  async (): Promise<AgentHistory> => readAgentHistory(8),
+);
+
 const checkRunsStep = span(
   { kind: 'AGENT', name: 'verify_runs' },
   async (repoUrl: string, facts: RepoFacts): Promise<RunStatus> => {
@@ -151,7 +197,19 @@ const planStep = span(
 
 const diagnoseStep = span(
   { kind: 'AGENT', name: 'diagnose' },
-  async (input: FixInput, facts: RepoFacts, analysis: RepoAnalysis, investigation: PiInvestigation, logTail: string): Promise<Pick<FixResult, 'mode' | 'diagnosis' | 'fix'>> => {
+  async (input: FixInput, facts: RepoFacts, analysis: RepoAnalysis, investigation: PiInvestigation, logTail: string, logSource: FixResult['logSource']): Promise<Pick<FixResult, 'mode' | 'diagnosis' | 'fix'>> => {
+    // Synthetic log? Diagnose the FILE evidence, not the fixture: the fixture
+    // describes a failure this repo may not have, while analysis holds real errors.
+    if (logSource === 'fixture') {
+      const errs = analysis.findings.filter((f) => f.startsWith('[error]')).slice(0, 4);
+      if (errs.length) {
+        return {
+          mode: 'playbook',
+          diagnosis: `File-evidence diagnosis (${errs.length} deterministic errors): ${errs.join(' ')}`,
+          fix: errs.join('\n'),
+        };
+      }
+    }
     // Playbook first (deterministic, $0). File findings + Pi evidence sharpen the fix text.
     const hit = await matchPlaybook(tailLines(logTail));
     if (hit) {
@@ -198,6 +256,10 @@ export const runFix = span({ kind: 'WORKFLOW', name: 'actionsforge-fix' }, async
       run: null,
       map,
       logSource: 'none',
+      applied: false,
+      patch: null,
+      rounds: [],
+      history: 'Skipped: analysis goal.',
     };
     setTraceOutput(`map: ${facts.repo} (${map.packages.length} pkgs, ${map.folders.length} dirs)`);
     return described;
@@ -220,6 +282,10 @@ export const runFix = span({ kind: 'WORKFLOW', name: 'actionsforge-fix' }, async
       run,
       map: null,
       logSource: 'none',
+      applied: false,
+      patch: null,
+      rounds: [],
+      history: 'Skipped: run is green.',
     };
     setTraceOutput(`green: run #${run.runId} @ ${facts.repo}`);
     return green;
@@ -229,15 +295,99 @@ export const runFix = span({ kind: 'WORKFLOW', name: 'actionsforge-fix' }, async
   const logSource: FixResult['logSource'] = input.logTail ? 'cli' : run.logTail ? 'run' : 'fixture';
   const logTail = input.logTail || run.logTail || FIXTURE_NODE_LOG;
 
+  // Self-reflection: read our own Neatlogs traces before acting.
+  const history = await reflectStep();
+
   const investigation = await span({ kind: 'AGENT', name: 'investigate' }, async () =>
-    investigateWithPi({ repoUrl: input.repoUrl, goal: input.goal, logTail: tailLines(logTail), facts }),
+    investigateWithPi({ repoUrl: input.repoUrl, goal: input.goal, logTail: tailLines(logTail), logProvenance: logSource, history: history.summary, facts }),
   )();
-  const d = await diagnoseStep(input, facts, analysis, investigation, logTail);
+  const d = await diagnoseStep(input, facts, analysis, investigation, logTail, logSource);
+
+  // Steps 1-3: generate the patch; push + trigger + watch only with --apply.
+  let patch: AppliedPatch | null = null;
+  let applied = false;
+  if ((d.mode === 'playbook' || d.mode === 'llm') && facts.workflowFiles.length) {
+    const target = facts.workflowFiles[0];
+    const current = await readRepoFile(input.repoUrl, target, facts.defaultBranch, 12000);
+    const gen = await generateWorkflowPatch({ path: target, current, diagnosis: d.diagnosis, fix: d.fix, nodeEngines: facts.nodeEngines });
+    patch = {
+      path: gen.path, summary: gen.summary, changed: gen.changed,
+      attempts: gen.attempts, verified: gen.verified, verifyNotes: gen.verifyNotes,
+      branch: null, commitSha: null, triggeredRunId: null,
+      triggeredRunUrl: '', triggeredConclusion: null, watchTimedOut: false,
+    };
+    if (input.apply && gen.changed) {
+      // Outer recovery loop: push -> trigger -> watch the REAL run -> feed its
+      // logs back into diagnose/regenerate -> repeat. Final verification is
+      // green conclusion AND an apk/aab artifact on the fix branch.
+      const branch = `actionsforge/fix-${run.runId ?? Date.now()}`;
+      const rounds: FixRound[] = [];
+      let branchContent = gen.newContent;
+      let curDiag: { mode: FixResult['mode']; diagnosis: string; fix: string } = { mode: d.mode, diagnosis: d.diagnosis, fix: d.fix };
+      let curLog = logTail;
+      let curSrc: FixResult['logSource'] = logSource;
+      let lastGen = gen;
+      let lastSha = '';
+      let finalVerified = false;
+      for (let n = 1; n <= MAX_FIX_ITERS; n++) {
+        if (n > 1) {
+          lastGen = await generateWorkflowPatch({ path: target, current: branchContent, diagnosis: curDiag.diagnosis, fix: curDiag.fix, nodeEngines: facts.nodeEngines });
+          if (lastGen.changed) branchContent = lastGen.newContent;
+        }
+        const pushed = await pushPatchToBranch(input.repoUrl, facts.defaultBranch, branch, target, branchContent, `fix(ci): ${lastGen.summary} (round ${n})`);
+        lastSha = pushed.commitSha;
+        const watched = await triggerAndWatch(input.repoUrl, target, branch, branch);
+        let artifactFound = false;
+        let artifacts: string[] = [];
+        let roundLog = '';
+        if (!watched.timedOut && watched.runId) {
+          artifacts = await listRunArtifacts(input.repoUrl, watched.runId);
+          artifactFound = artifacts.some((a) => /\.apk$|\.aab$/i.test(a));
+          const st = await getLatestRunStatus(input.repoUrl, branch, target);
+          roundLog = st.logTail;
+        }
+        const ok = watched.conclusion === 'success' && artifactFound && !watched.timedOut;
+        rounds.push({
+          n, branch, patchSummary: lastGen.summary, triggeredRunId: watched.runId,
+          triggeredRunUrl: watched.runUrl, conclusion: watched.conclusion,
+          artifacts: artifacts.slice(0, 10), artifactFound, verified: ok, logSource: curSrc,
+        });
+        if (ok) {
+          finalVerified = true;
+          break;
+        }
+        if (watched.timedOut || !roundLog) break;
+        curLog = roundLog;
+        curSrc = 'run';
+        curDiag = await diagnoseStep(input, facts, analysis, investigation, curLog, curSrc);
+      }
+      patch = {
+        path: target, summary: lastGen.summary, changed: true,
+        attempts: lastGen.attempts, verified: finalVerified, verifyNotes: lastGen.verifyNotes,
+        branch, commitSha: lastSha,
+        triggeredRunId: rounds[rounds.length - 1]?.triggeredRunId ?? null,
+        triggeredRunUrl: rounds[rounds.length - 1]?.triggeredRunUrl ?? '',
+        triggeredConclusion: rounds[rounds.length - 1]?.conclusion ?? null,
+        watchTimedOut: rounds.some((r) => r.triggeredRunId === 0),
+      };
+      applied = true;
+      const result: FixResult = {
+        mode: curDiag.mode as FixResult['mode'], diagnosis: curDiag.diagnosis, fix: curDiag.fix,
+        report: '',
+        iterations: rounds.length,
+        verified: finalVerified,
+        facts, analysis, investigation, run, map: null, logSource: curSrc,
+        applied, patch, rounds, history: history.summary,
+      };
+      setTraceOutput(`${finalVerified ? 'fixed' : 'unfixed'}(${rounds.length} rounds): ${curDiag.diagnosis} @ ${facts.repo} branch ${branch}`);
+      return result;
+    }
+  }
+
   const result: FixResult = {
     ...d,
     report: '',
     iterations: 1,
-    // Skeleton verify: real APK-artifact check lands with trigger/watch.
     verified: false,
     facts,
     analysis,
@@ -245,6 +395,10 @@ export const runFix = span({ kind: 'WORKFLOW', name: 'actionsforge-fix' }, async
     run,
     map: null,
     logSource,
+    applied,
+    patch,
+    rounds: [],
+    history: history.summary,
   };
   setTraceOutput(`${result.mode}(${logSource}): ${result.diagnosis} @ ${facts.repo} (investigator: ${investigation.filesRead.length} files, ${investigation.stoppedWhy})`);
   return result;

@@ -1,4 +1,4 @@
-import { Agent, type AgentTool } from '@earendil-works/pi-agent-core';
+import { Agent, type AgentTool, type BeforeToolCallContext } from '@earendil-works/pi-agent-core';
 import { Type, createModels, createProvider, envApiKeyAuth } from '@earendil-works/pi-ai';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import { piAgentHooks } from 'neatlogs/pi-agent';
@@ -12,7 +12,7 @@ export interface PiInvestigation {
   stoppedWhy: 'finished' | 'turn-cap' | 'error';
 }
 
-const MAX_TOOL_TURNS = 10;
+const MAX_TOOL_TURNS = 15;
 
 function extractText(messages: unknown): string {
   if (!Array.isArray(messages)) return '';
@@ -62,6 +62,8 @@ export async function investigateWithPi(input: {
   repoUrl: string;
   goal: string;
   logTail: string;
+  logProvenance: string;
+  history: string;
   facts: RepoFacts;
 }): Promise<PiInvestigation> {
   if (!config.litellmBaseUrl) throw new Error('LITELLM_BASE_URL is missing (see .env.example).');
@@ -96,6 +98,11 @@ export async function investigateWithPi(input: {
   if (!model) throw new Error(`Model ${config.litellmModel} not found in litellm provider`);
 
   const filesRead: string[] = [];
+  const seenCalls = new Set<string>();
+  const toolKey = (ctx: BeforeToolCallContext): string => {
+    const call = ctx.toolCall as unknown as { name?: string; tool?: string };
+    return `${call.name ?? call.tool ?? '?'}:${JSON.stringify(ctx.args)}`;
+  };
   const readFile: AgentTool = {
     name: 'github_read_file',
     label: 'Read GitHub file',
@@ -105,7 +112,7 @@ export async function investigateWithPi(input: {
       const p = params as { path: string };
       const content = await readRepoFile(input.repoUrl, p.path, input.facts.defaultBranch);
       if (!content) return { content: [{ type: 'text', text: `MISSING: ${p.path} unreadable. Pick another file.` }], details: {} };
-      filesRead.push(p.path);
+      if (!filesRead.includes(p.path)) filesRead.push(p.path);
       return {
         content: [{ type: 'text', text: `FILE ${p.path} (${content.length} chars):\n${content.slice(0, 6000)}` }],
         details: { path: p.path, chars: content.length },
@@ -127,28 +134,36 @@ export async function investigateWithPi(input: {
   const agent = piAgentHooks(
     new Agent({
       initialState: {
-        systemPrompt: `You investigate GitHub Actions CI failures (read-only). Goal: ${input.goal}. Repo: ${input.repoUrl}. Failing log tail:\n${input.logTail.slice(-800)}\nOpen workflow files and the configs they reference, follow evidence, then write a final summary: what the repo actually builds, what is broken with file-path evidence, and the concrete fix. Cite file paths. Do not claim an APK unless you saw android/ build output and an upload-artifact path. Always finish with a plain-text findings summary (not just reasoning): what builds, what is broken, the concrete fix.`,
+        systemPrompt: `You investigate GitHub Actions CI failures (read-only). Goal: ${input.goal}. Repo: ${input.repoUrl}. Own history from Neatlogs (past runs of this agent — avoid repeating failed strategies): ${input.history}. Failing log tail (provenance: ${input.logProvenance} — ${input.logProvenance === 'fixture' ? 'a SYNTHETIC stand-in that may not match this repo; weigh file evidence higher and say so' : 'from the real failing run; trust it'}):\n${input.logTail.slice(-800)}\nOpen workflow files and the configs they reference, follow evidence, then write a final summary: what the repo actually builds, what is broken with file-path evidence, and the concrete fix. Cite file paths. Do not claim an APK unless you saw android/ build output and an upload-artifact path. Always finish with a plain-text findings summary (not just reasoning): what builds, what is broken, the concrete fix.`,
         model,
         thinkingLevel: 'medium',
         tools: [readFile, listDir],
         messages: [],
       },
       streamFn: models.streamSimple.bind(models),
+      // Harness-owned guards: block exact repeats with feedback (model continues),
+      // count real executions for the cap (streaming events overcount).
+      beforeToolCall: async (ctx) => {
+        const key = toolKey(ctx);
+        if (seenCalls.has(key)) {
+          return { block: true, reason: `Already ran ${key} — its observation is above. Read a different file or finish with your summary.` };
+        }
+        seenCalls.add(key);
+        return undefined;
+      },
+      afterToolCall: async () => {
+        toolTurns += 1;
+        if (toolTurns >= MAX_TOOL_TURNS) {
+          stoppedWhy = 'turn-cap';
+          agent.abort();
+        }
+        return undefined;
+      },
     }),
   );
 
   let toolTurns = 0;
   let stoppedWhy: PiInvestigation['stoppedWhy'] = 'finished';
-  agent.subscribe((event) => {
-    const t = (event as { type?: string }).type ?? '';
-    if (t.includes('tool')) {
-      toolTurns += 1;
-      if (toolTurns >= MAX_TOOL_TURNS) {
-        stoppedWhy = 'turn-cap';
-        agent.abort();
-      }
-    }
-  });
 
   try {
     await agent.prompt(

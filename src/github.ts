@@ -88,7 +88,8 @@ export const inspectRepo = span(
         packageManager?: string;
       };
       nodeEngines = pkg.engines?.node ?? '';
-      packageManager = pkg.packageManager ?? (has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : 'npm');
+      // Normalize "yarn@1.22.19" -> "yarn": CI steps name the tool, not the version.
+      packageManager = (pkg.packageManager ?? '').split('@')[0] || (has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : 'npm');
     } catch {
       // leave defaults
     }
@@ -546,6 +547,88 @@ export const mapRepo = span(
       if (raw) docs.push({ path: d, excerpt: raw.replace(/\s+/g, ' ').trim().slice(0, 1200) });
     }
     return { folders, packages, entryPoints, docFiles, docs };
+  },
+);
+
+export interface BranchResult {
+  branch: string;
+  commitSha: string;
+  filePath: string;
+}
+
+/** Branch + push: always a new branch, never main. */
+export const pushPatchToBranch = span(
+  { kind: 'TOOL', toolName: 'github_push_patch' },
+  async (repoUrl: string, baseBranch: string, branch: string, path: string, content: string, message: string): Promise<BranchResult> => {
+    const ctx = parseRepoUrl(repoUrl);
+    const octo = getOctokit();
+    const { data: base } = await octo.git.getRef({ owner: ctx.owner, repo: ctx.repo, ref: `heads/${baseBranch}` });
+    try {
+      await octo.git.createRef({ owner: ctx.owner, repo: ctx.repo, ref: `refs/heads/${branch}`, sha: base.object.sha });
+    } catch {
+      // Branch exists (re-run): reuse it so pushes stay idempotent.
+    }
+    let sha = '';
+    try {
+      const { data } = await octo.repos.getContent({ owner: ctx.owner, repo: ctx.repo, path, ref: branch });
+      if (!Array.isArray(data) && data.type === 'file') sha = data.sha;
+    } catch {
+      // New file on this branch.
+    }
+    const { data: commit } = await octo.repos.createOrUpdateFileContents({
+      owner: ctx.owner, repo: ctx.repo, path, message, content: Buffer.from(content, 'utf8').toString('base64'),
+      branch, ...(sha ? { sha } : {}),
+    });
+    return { branch, commitSha: commit.commit.sha ?? '', filePath: path };
+  },
+);
+
+export interface WatchResult {
+  runId: number;
+  runUrl: string;
+  conclusion: string | null;
+  timedOut: boolean;
+}
+
+/** Artifacts of a completed run (names only — the verify step matches apk/aab). */
+export const listRunArtifacts = span(
+  { kind: 'TOOL', toolName: 'github_list_artifacts' },
+  async (repoUrl: string, runId: number): Promise<string[]> => {
+    const ctx = parseRepoUrl(repoUrl);
+    try {
+      const { data } = await getOctokit().actions.listWorkflowRunArtifacts({ owner: ctx.owner, repo: ctx.repo, run_id: runId, per_page: 30 });
+      return data.artifacts.map((a) => a.name);
+    } catch {
+      return [];
+    }
+  },
+);
+
+/** Trigger via workflow_dispatch, then poll with backoff to completion. */
+export const triggerAndWatch = span(
+  { kind: 'TOOL', toolName: 'github_trigger_watch' },
+  async (repoUrl: string, workflowFile: string, branch: string, ref: string): Promise<WatchResult> => {
+    const ctx = parseRepoUrl(repoUrl);
+    const octo = getOctokit();
+    const { data: wf } = await octo.actions.listRepoWorkflows({ owner: ctx.owner, repo: ctx.repo, per_page: 50 });
+    const fileName = workflowFile.split('/').pop() ?? '';
+    const match = wf.workflows.find((w) => w.path === workflowFile || w.path.endsWith('/' + fileName));
+    if (!match) throw new Error(`Workflow ${workflowFile} not registered.`);
+    await octo.actions.createWorkflowDispatch({ owner: ctx.owner, repo: ctx.repo, workflow_id: match.id, ref });
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 20000));
+      const { data } = await octo.actions.listWorkflowRuns({
+        owner: ctx.owner, repo: ctx.repo, workflow_id: match.id, branch, per_page: 3,
+      });
+      const latest = data.workflow_runs[0];
+      if (latest && latest.status === 'completed') {
+        return { runId: latest.id, runUrl: latest.html_url, conclusion: latest.conclusion, timedOut: false };
+      }
+      if (Date.now() > deadline) {
+        return { runId: latest?.id ?? 0, runUrl: latest?.html_url ?? '', conclusion: latest?.conclusion ?? null, timedOut: true };
+      }
+    }
   },
 );
 

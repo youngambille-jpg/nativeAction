@@ -17,8 +17,9 @@ async function main(): Promise<void> {
     // Empty unless explicitly supplied: the agent prefers the real run log,
     // falling back to the fixture only when the workflow never ran.
     const logTail = logFile ? readFileSync(logFile, 'utf8') : arg('log-tail');
+    const apply = process.argv.includes('--apply');
 
-    const result = await runFix({ repoUrl, goal, logTail });
+    const result = await runFix({ repoUrl, goal, logTail, apply });
     console.log(JSON.stringify({ traceWorkflow: 'actionsforge-fix', ...result }, null, 2));
   } finally {
     await drainTelemetry();
