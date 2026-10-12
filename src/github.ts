@@ -17,13 +17,19 @@ export interface RepoFacts {
   defaultBranch: string;
   languages: string[];
   isReactNative: boolean;
+  /** Subdirs whose package.json depends on react-native ('' = root). */
+  rnRoots: string[];
   hasAndroid: boolean;
+  /** All dirs containing an android app (android/gradlew or android/app). */
+  androidDirs: string[];
   hasIos: boolean;
   nodeEngines: string;
   packageManager: string;
   workflowFiles: string[];
   topLevel: string[];
   fileCount: number;
+  /** Largest committed files (path + bytes), lockfiles excluded. */
+  largest: Array<{ path: string; size: number }>;
   note: string;
 }
 
@@ -48,8 +54,11 @@ export const inspectRepo = span(
       recursive: 'true',
     });
     const paths = (tree.tree ?? []).map((t) => t.path ?? '').filter(Boolean);
+    const sizes = new Map((tree.tree ?? []).map((t) => [t.path ?? '', t.size ?? 0] as const));
+    const known = new Set(paths);
     const has = (p: string) => paths.some((x) => x === p || x.startsWith(p + '/'));
     const text = async (path: string): Promise<string> => {
+      if (!known.has(path)) return '';
       try {
         const { data } = await octo.repos.getContent({ owner: ctx.owner, repo: ctx.repo, path, ref: branch });
         if (Array.isArray(data) || data.type !== 'file' || !('content' in data)) return '';
@@ -62,21 +71,41 @@ export const inspectRepo = span(
     const pkgRaw = await text('package.json');
     let nodeEngines = '';
     let packageManager = '';
-    let isReactNative = false;
+    const rnRoots: string[] = [];
+    const depHit = (raw: string): boolean => {
+      try {
+        const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+        const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+        return 'react-native' in deps || '@react-native-community/cli' in deps;
+      } catch {
+        return false;
+      }
+    };
+    if (depHit(pkgRaw)) rnRoots.push('');
     try {
       const pkg = JSON.parse(pkgRaw || '{}') as {
         engines?: { node?: string };
         packageManager?: string;
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
       };
       nodeEngines = pkg.engines?.node ?? '';
       packageManager = pkg.packageManager ?? (has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : 'npm');
-      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
-      isReactNative = 'react-native' in deps;
     } catch {
       // leave defaults
     }
+    // Deep scan: nested apps (monorepos) keep react-native + android/ away from root.
+    const nestedPkgs = paths
+      .filter((p) => p.endsWith('/package.json') && !p.includes('node_modules') && p.split('/').length <= 4)
+      .slice(0, 8);
+    for (const np of nestedPkgs) {
+      const raw = await text(np);
+      if (raw && depHit(raw)) rnRoots.push(np.slice(0, -'/package.json'.length));
+    }
+    const androidDirs = [...new Set(
+      paths
+        .filter((p) => /(^|\/)android\/(gradlew|app\/build\.gradle|app\/src\/)/.test(p))
+        .map((p) => p.slice(0, p.indexOf('android/') + 'android'.length)),
+    )].slice(0, 8);
+    const isReactNative = rnRoots.length > 0;
     const workflowFiles = paths.filter((p) => p.startsWith('.github/workflows/')).slice(0, 20);
 
     const facts: RepoFacts = {
@@ -84,17 +113,26 @@ export const inspectRepo = span(
       defaultBranch: branch,
       languages: [repo.language ?? 'unknown'],
       isReactNative,
+      rnRoots,
       hasAndroid: has('android'),
+      androidDirs,
       hasIos: has('ios'),
       nodeEngines,
       packageManager,
       workflowFiles,
       topLevel: [...new Set(paths.map((p) => p.split('/')[0]))].slice(0, 30),
       fileCount: paths.length,
+      largest: paths
+        .filter((p) => !/lock\.yaml$|\.lock$|pnpm-lock/.test(p))
+        .map((p) => ({ path: p, size: sizes.get(p) ?? 0 }))
+        .sort((a, b) => b.size - a.size)
+        .slice(0, 10),
       note:
-        !isReactNative && !has('android')
-          ? 'Not a React Native Android project: no react-native dependency and no android/ dir. Treat as generic Node/TS; do not promise an APK.'
-          : '',
+        !isReactNative && !androidDirs.length
+          ? 'Not a React Native Android project: no react-native dependency in root or nested package.json files, and no android/ app dir at any depth. Treat as generic Node/TS; do not promise an APK.'
+          : isReactNative
+            ? `React Native app found at: ${rnRoots.map((r) => r || '(root)').join(', ')}. Android dirs: ${androidDirs.join(', ') || 'none'}.`
+            : '',
     };
     return facts;
   },
@@ -124,7 +162,11 @@ export interface FileFinding {
 
 export interface RepoAnalysis {
   filesRead: FileFinding[];
+  /** Rendered findings, prefixed [error]/[warn]/[info]. Deterministic, $0. */
   findings: string[];
+  workflows: WorkflowBrief[];
+  errors: number;
+  warns: number;
 }
 
 export const readRepoFile = span(
@@ -141,18 +183,65 @@ export const readRepoFile = span(
   },
 );
 
+export type Severity = 'error' | 'warn' | 'info';
+
+export interface WorkflowBrief {
+  file: string;
+  jobs: number;
+  steps: number;
+  triggers: string;
+  runsOn: string;
+  nodePin: string;
+  javaPin: string;
+  packageManagerInCi: string;
+  buildsApk: boolean;
+  uploadsArtifact: boolean;
+}
+
+export interface RepoAnalysis {
+  filesRead: FileFinding[];
+  /** Rendered findings, prefixed [error]/[warn]/[info]. Deterministic, $0. */
+  findings: string[];
+  workflows: WorkflowBrief[];
+  errors: number;
+  warns: number;
+}
+
+const err = (file: string, message: string): string => `[error] ${file}: ${message}`;
+const warn = (file: string, message: string): string => `[warn] ${file}: ${message}`;
+const info = (file: string, message: string): string => `[info] ${file}: ${message}`;
+
+interface WfStep {
+  name?: string;
+  uses?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+  env?: Record<string, unknown>;
+}
+
+function str(v: unknown): string {
+  return typeof v === 'string' ? v : v == null ? '' : String(v);
+}
+
 /**
- * The analysis loop: opens each key file in turn (workflow YAMLs first,
- * then package.json / workspace / codemagic) and runs deterministic checks.
- * One TOOL span per file so the trace shows the loop iterating.
+ * Deep deterministic analysis: parses workflow YAML structurally (not regex),
+ * follows the files the workflow references (CI configs, gradle files, app
+ * manifests), and grades package.json scripts. Everything here is free and
+ * feeds the Pi investigator + diagnose steps as evidence.
  */
 export const analyzeRepo = span(
   { kind: 'TOOL', toolName: 'github_analyze_files' },
   async (repoUrl: string, facts: RepoFacts): Promise<RepoAnalysis> => {
+    const { parse } = await import('yaml');
     const findings: string[] = [];
+    const workflows: WorkflowBrief[] = [];
     const filesRead: FileFinding[] = [];
-    const read = async (path: string): Promise<string> => {
-      const content = await readRepoFile(repoUrl, path, facts.defaultBranch);
+    const read = async (path: string, maxChars = 8000): Promise<string> => {
+      if (!allPaths.has(path)) {
+        filesRead.push({ path, chars: 0, summary: 'absent from tree (no request sent)' });
+        return '';
+      }
+      const content = await readRepoFile(repoUrl, path, facts.defaultBranch, maxChars);
       filesRead.push({
         path,
         chars: content.length,
@@ -160,74 +249,303 @@ export const analyzeRepo = span(
       });
       return content;
     };
+    const last = (): FileFinding => filesRead[filesRead.length - 1];
+    // One bounded tree listing so lead-following never fires 404s.
+    const allPaths = new Set(await listTree(repoUrl, facts.defaultBranch, '', 2000));
 
-    // 1. Workflow files: loop through each, checking the known RN-Android
-    // failure modes from the playbook (PLAN.md eval set).
+    // 1. Workflow files, parsed as YAML.
     for (const wf of facts.workflowFiles.slice(0, 5)) {
-      const yml = await read(wf);
-      if (!yml) {
-        findings.push(`${wf}: listed in tree but unreadable; cannot verify its steps.`);
+      const raw = await read(wf, 12000);
+      if (!raw) {
+        findings.push(err(wf, 'listed in tree but unreadable; cannot verify its steps.'));
         continue;
       }
-      const nodePin = yml.match(/node-version\s*:\s*['"]?([^'"\s]+)/i)?.[1] ?? '';
-      const javaPin = yml.match(/java-version\s*:\s*['"]?([^'"\s]+)/i)?.[1] ?? '';
-      const usesNpmCi = /npm\s+ci/i.test(yml);
-      const usesPnpm = /pnpm/i.test(yml);
-      const hasChmod = /chmod\s+\+x.*gradlew|update-index\s+--chmod=\+x.*gradlew/i.test(yml);
-      const touchesGradle = /gradlew|assembleRelease|assembleDebug/i.test(yml);
-      const artifactPath = yml.match(/path\s*:\s*(.+apk[^\s'"]*)/i)?.[1]?.trim() ?? '';
+      let doc: any = null;
+      try {
+        doc = parse(raw);
+      } catch {
+        findings.push(err(wf, 'is not valid YAML — Actions will refuse to run it.'));
+        continue;
+      }
+      const jobs: Record<string, any> = doc?.jobs ?? {};
+      const jobNames = Object.keys(jobs);
+      const steps: WfStep[] = jobNames.flatMap((j) => (Array.isArray(jobs[j]?.steps) ? jobs[j].steps : []));
+      const on = doc?.on;
+      const triggers = typeof on === 'string' ? on : Array.isArray(on) ? on.join(',') : on ? Object.keys(on).join(',') : 'none';
+      const runsOn = [...new Set(jobNames.map((j) => str(jobs[j]?.['runs-on']).replace(/["{}]/g, '')))].filter(Boolean).join(',') || 'unset';
+      const brief: WorkflowBrief = {
+        file: wf, jobs: jobNames.length, steps: steps.length, triggers, runsOn,
+        nodePin: '', javaPin: '', packageManagerInCi: '', buildsApk: false, uploadsArtifact: false,
+      };
 
-      const bits: string[] = [];
-      if (nodePin) bits.push(`node-version=${nodePin}`);
-      if (facts.nodeEngines && nodePin && !facts.nodeEngines.includes(nodePin.replace('.x', ''))) {
-        findings.push(`${wf}: pins node ${nodePin} but package.json engines want ${facts.nodeEngines}.`);
+      if (!jobNames.length) findings.push(err(wf, 'defines no jobs.'));
+      if (!triggers || triggers === 'none') findings.push(err(wf, 'has no `on:` trigger — it will never run.'));
+      if (!/push/.test(triggers)) findings.push(warn(wf, `trigger (${triggers}) won't run on push to main — goal requires push coverage.`));
+      if (!/ubuntu/.test(runsOn)) findings.push(warn(wf, `runs on [${runsOn || 'unset'}]; Android builds expect ubuntu-latest.`));
+      if (doc?.permissions == null && !doc?.jobs) findings.push(info(wf, 'no top-level permissions block; GITHUB_TOKEN gets broad defaults.'));
+      for (const j of jobNames) {
+        if (jobs[j]?.['timeout-minutes'] == null && /gradlew|assemble/i.test(JSON.stringify(jobs[j]))) {
+          findings.push(warn(wf, `job "${j}" builds Android with no timeout-minutes — a stuck Gradle run burns minutes until the 6h default.`));
+        }
       }
-      if (usesNpmCi && facts.packageManager === 'pnpm') {
-        findings.push(`${wf}: runs 'npm ci' but the repo uses pnpm (pnpm-lock.yaml present) — install step will fail or drift.`);
+
+      let nodePin = '', javaPin = '', pmInCi = '';
+      let chmodIdx = -1, gradleIdx = -1;
+      steps.forEach((s, i) => {
+        const uses = str(s.uses);
+        const run = str(s.run);
+        if (/setup-node/i.test(uses)) nodePin = str(s.with?.['node-version']);
+        if (/setup-java/i.test(uses)) javaPin = str(s.with?.['java-version']);
+        if (/pnpm\/action-setup/i.test(uses)) pmInCi = 'pnpm';
+        if (/\bzuela(.+)?\/setup-node/i.test(uses)) pmInCi = pmInCi || 'node';
+        if (/npm\s+ci/.test(run)) pmInCi = pmInCi || 'npm';
+        if (/pnpm\s+(install|ci|add)/.test(run)) pmInCi = 'pnpm';
+        if (/yarn/.test(run) && !pmInCi) pmInCi = 'yarn';
+        if (/chmod\s+\+x.*gradlew|update-index\s+--chmod=\+x/i.test(run)) chmodIdx = i;
+        if (/gradlew\s+(assemble|bundle|test|connected)/i.test(run)) gradleIdx = i;
+        const v = uses.match(/@v(\d+)/)?.[1];
+        if (uses && v && Number(v) < 4 && /actions\/(checkout|setup-node|setup-java|upload-artifact|download-artifact)/.test(uses)) {
+          findings.push(info(wf, `"${uses}" predates v4 — works, but pin to v4+ for cache/security fixes.`));
+        }
+      });
+      brief.nodePin = nodePin; brief.javaPin = javaPin; brief.packageManagerInCi = pmInCi;
+      brief.buildsApk = steps.some((s) => /gradlew\s+(assemble|bundle)/i.test(str(s.run)));
+      brief.uploadsArtifact = steps.some((s) => /upload-artifact/i.test(str(s.uses)));
+
+      if (facts.nodeEngines && nodePin && !facts.nodeEngines.includes(nodePin.replace(/\.x$/, ''))) {
+        findings.push(err(wf, `pins node ${nodePin} but package.json engines want ${facts.nodeEngines}.`));
       }
-      if (!usesPnpm && facts.packageManager === 'pnpm' && /npm/i.test(yml)) {
-        findings.push(`${wf}: repo is pnpm-based; workflow should use pnpm/action-setup + 'pnpm install --frozen-lockfile'.`);
+      if (!nodePin && steps.some((s) => /node|npm|pnpm|yarn/i.test(str(s.run) + str(s.uses)))) {
+        findings.push(warn(wf, 'runs JS tooling without actions/setup-node — runner default Node is unpredictable.'));
       }
-      if (javaPin && !/17/.test(javaPin) && touchesGradle) {
-        findings.push(`${wf}: java-version=${javaPin} but Gradle/RN builds need JDK 17.`);
+      if (pmInCi && pmInCi !== facts.packageManager) {
+        findings.push(err(wf, `installs with ${pmInCi} but the repo locks with ${facts.packageManager} — deps will drift or the step fails.`));
       }
-      if (touchesGradle && !hasChmod) {
-        findings.push(`${wf}: invokes gradlew without chmod +x — add a chmod step (fails on fresh checkouts).`);
+      if (facts.packageManager === 'pnpm' && !steps.some((s) => /pnpm\/action-setup/i.test(str(s.uses)))) {
+        findings.push(warn(wf, `repo is pnpm-based but no pnpm/action-setup step; add it with cache for install speed.`));
       }
-      if (/assembleRelease|assembleDebug/i.test(yml) && !artifactPath) {
-        findings.push(`${wf}: builds an APK/AAB but has no upload-artifact path for it — green runs produce nothing to verify.`);
+      if (javaPin && !/17/.test(javaPin) && gradleIdx >= 0) {
+        findings.push(err(wf, `java-version=${javaPin} but Gradle/RN Android builds need JDK 17.`));
       }
-      if (artifactPath) bits.push(`artifact=${artifactPath}`);
-      if (!bits.length && !findings.some((f) => f.startsWith(wf))) bits.push('no version pins detected');
-      filesRead[filesRead.length - 1].summary = bits.join('; ');
+      if (!javaPin && gradleIdx >= 0) {
+        findings.push(warn(wf, 'invokes Gradle without actions/setup-java — runner JDK is unpredictable.'));
+      }
+      if (gradleIdx >= 0 && chmodIdx < 0) {
+        findings.push(err(wf, 'invokes gradlew without chmod +x (fails on fresh checkouts) — add `chmod +x android/gradlew` first.'));
+      }
+      if (gradleIdx >= 0 && chmodIdx > gradleIdx) {
+        findings.push(err(wf, 'chmod step comes AFTER the gradle invocation — reorder it before.'));
+      }
+      if (brief.buildsApk && !brief.uploadsArtifact) {
+        findings.push(err(wf, 'assembles APK/AAB but never uploads it — green runs produce nothing to verify (eval case #6).'));
+      }
+      const artStep = steps.find((s) => /upload-artifact/i.test(str(s.uses)));
+      if (artStep && !/\.apk|\.aab|outputs/i.test(JSON.stringify(artStep.with ?? {}))) {
+        findings.push(warn(wf, 'upload-artifact path does not look like an APK/AAB output dir — verify it matches the Gradle output.'));
+      }
+      last().summary = `jobs:${brief.jobs} steps:${brief.steps} on:[${triggers}] runs-on:[${runsOn}]${nodePin ? ` node=${nodePin}` : ''}${javaPin ? ` java=${javaPin}` : ''}${brief.buildsApk ? ' builds-apk' : ''}${brief.uploadsArtifact ? ' uploads-artifact' : ''}`;
+      workflows.push(brief);
     }
-    if (!facts.workflowFiles.length) findings.push('No .github/workflows files: setup-from-scratch case (eval #1).');
+    if (!facts.workflowFiles.length) findings.push(err('repo', 'No .github/workflows files: setup-from-scratch case (eval #1).'));
 
-    // 2. package.json scripts/engines + workspace manager.
+    // 2. package.json, graded by role.
     const pkgRaw = await read('package.json');
     if (pkgRaw) {
       try {
-        const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, string>; engines?: { node?: string } };
-        const scripts = Object.keys(pkg.scripts ?? {});
-        if (!scripts.length) findings.push('package.json has no scripts: nothing for CI to run (add build/test/lint).');
-        else filesRead[filesRead.length - 1].summary = `scripts: ${scripts.slice(0, 8).join(', ')}`;
-        if (!pkg.engines?.node) findings.push('package.json sets no engines.node: pin it so CI and the workflow agree.');
+        const pkg = JSON.parse(pkgRaw) as {
+          scripts?: Record<string, string>;
+          engines?: { node?: string };
+          packageManager?: string;
+          dependencies?: Record<string, string>;
+          devDependencies?: Record<string, string>;
+        };
+        const scripts = pkg.scripts ?? {};
+        const has = (...names: string[]): string => names.find((n) => n in scripts) ?? '';
+        const roles: Array<[string, string[]]> = [
+          ['build', ['build', 'build:android', 'assembleRelease']],
+          ['test', ['test', 'test:ci', 'jest']],
+          ['lint', ['lint', 'lint:ci']],
+          ['typecheck', ['typecheck', 'tsc', 'type-check']],
+          ['e2e', ['e2e', 'detox', 'maestro']],
+        ];
+        const missing = roles.filter(([, names]) => !has(...names)).map(([r]) => r);
+        if (missing.length) findings.push(warn('package.json', `no scripts for: ${missing.join(', ')} — CI can only run what exists.`));
+        last().summary = `scripts: ${Object.keys(scripts).slice(0, 10).join(', ') || 'none'}`;
+        if (!pkg.engines?.node) findings.push(warn('package.json', 'sets no engines.node: pin it so CI and the workflow agree.'));
+        const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+        if ('expo' in deps && !facts.workflowFiles.some((w) => w.includes('eas'))) {
+          findings.push(info('package.json', 'Expo project without an EAS workflow — `expo prebuild`/EAS Build may be the intended path.'));
+        }
       } catch {
-        findings.push('package.json is not valid JSON.');
+        findings.push(err('package.json', 'is not valid JSON.'));
       }
     }
-    const workspace = await read('pnpm-workspace.yaml');
-    if (workspace && !/packages:/i.test(workspace)) findings.push('pnpm-workspace.yaml has no packages: field — workspace may mis-resolve in CI.');
 
-    // 3. Project-type reality check (this target is the proof case).
-    if (!facts.isReactNative && !facts.hasAndroid) {
+    // 3. Follow the leads the workflow references (bounded: only files in the tree).
+    // App manifests live beside the app — check each RN root too, not just repo root.
+    const extras = [
+      'codemagic.yaml', 'eas.json', 'app.json', 'expo.json', 'pnpm-workspace.yaml',
+      ...facts.rnRoots.filter(Boolean).flatMap((r) => [`${r}/app.json`, `${r}/eas.json`, `${r}/expo.json`, `${r}/metro.config.js`]),
+    ];
+    for (const e of extras) {
+      const content = await read(e);
+      if (!content) continue;
+      if (e === 'pnpm-workspace.yaml' && !/packages:/i.test(content)) {
+        findings.push(warn(e, 'has no packages: field — workspace may mis-resolve in CI.'));
+      }
+      if ((e === 'app.json' || e === 'expo.json') && !/android/i.test(content)) {
+        findings.push(info(e, 'declares no android config — APK output needs an android profile.'));
+      }
+    }
+    for (const dir of facts.androidDirs.slice(0, 2)) {
+      const props = await read(`${dir}/gradle.properties`);
+      if (props && !/org\.gradle\.jvmargs/i.test(props)) {
+        findings.push(info(`${dir}/gradle.properties`, 'no org.gradle.jvmargs — large RN builds OOM without heap tuning.'));
+      }
+      const appGradle = await read(`${dir}/app/build.gradle`);
+      if (appGradle) {
+        const appId = appGradle.match(/applicationId\s+["']([^"']+)["']/)?.[1] ?? '';
+        if (!appId) findings.push(warn(`${dir}/app/build.gradle`, 'no applicationId found — APK cannot be signed/published without it.'));
+      }
+    }
+
+    // 4. Project-type reality check (deep: root + nested apps + any-depth android/).
+    if (!facts.isReactNative && !facts.androidDirs.length) {
       findings.push(
-        `Not React Native: no react-native dep, no android/ dir, yet .github/workflows holds ${facts.workflowFiles.join(', ') || 'nothing'} — read ${facts.workflowFiles[0] ?? 'the workflow'} to see what it actually builds before promising an APK.`,
+        warn('repo', `Not React Native: no react-native dep in root or nested package.json, no android/ app dir at any depth, yet workflows hold ${facts.workflowFiles.join(', ') || 'nothing'} — artifact claims need scrutiny before promising an APK.`),
+      );
+    } else if (facts.isReactNative) {
+      findings.push(
+        info('repo', `React Native app at ${facts.rnRoots.map((r) => r || '(root)').join(', ')}; android dirs: ${facts.androidDirs.join(', ') || 'NONE — APK build impossible until the android/ project exists'}.`),
       );
     }
-    if (!findings.length) findings.push('No deterministic issues found; needs LLM diagnosis over the failing log tail.');
+    if (!findings.length) findings.push(info('repo', 'No deterministic issues found; needs LLM diagnosis over the failing log tail.'));
 
-    return { filesRead, findings };
+    const errors = findings.filter((f) => f.startsWith('[error]')).length;
+    const warns = findings.filter((f) => f.startsWith('[warn]')).length;
+    return { filesRead, findings, workflows, errors, warns };
+  },
+);
+
+export interface FolderMap {
+  dir: string;
+  files: number;
+  /** Count by file extension, e.g. {ts: 40, md: 3}. */
+  kinds: Record<string, number>;
+  notable: string[];
+  /** Full listing when the folder is small enough to show everything. */
+  sample: string[];
+  /** First 400 chars of the folder README, if it has one. */
+  readme: string;
+}
+
+export interface PackageMap {
+  dir: string;
+  name: string;
+  description: string;
+  scripts: string[];
+  depCount: number;
+  hasReadme: boolean;
+  hasTests: boolean;
+}
+
+export interface DocDigest {
+  path: string;
+  excerpt: string;
+}
+
+export interface RepoMap {
+  folders: FolderMap[];
+  packages: PackageMap[];
+  entryPoints: string[];
+  docFiles: string[];
+  /** Excerpts of the most informative docs (READMEs, root *.md), capped. */
+  docs: DocDigest[];
+}
+
+/**
+ * File-by-file, folder-by-folder map of what's inside the repo. Deterministic:
+ * groups the tree, summarizes every workspace package, lists CI + docs +
+ * probable entry points. Built for analysis goals ("analyse this repo").
+ */
+export const mapRepo = span(
+  { kind: 'TOOL', toolName: 'github_map_repo' },
+  async (repoUrl: string, facts: RepoFacts, analysis: RepoAnalysis): Promise<RepoMap> => {
+    const all = await listTree(repoUrl, facts.defaultBranch, '', 2000);
+    const inTree = new Set(all);
+    const byDir = new Map<string, string[]>();
+    for (const p of all) {
+      const dir = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '(root)';
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir)?.push(p);
+    }
+    const extOf = (p: string): string => {
+      const base = p.split('/').pop() ?? '';
+      const i = base.lastIndexOf('.');
+      return i > 0 ? base.slice(i + 1).toLowerCase() : '(no-ext)';
+    };
+    const readIfPresent = async (path: string, maxChars: number): Promise<string> =>
+      inTree.has(path) ? readRepoFile(repoUrl, path, facts.defaultBranch, maxChars) : '';
+    const notablePat = /(read ?me|license|contribut|code_of_conduct|dockerfile|compose\.ya?ml|\.replit|codemagic\.ya?ml|eas\.json|app\.json|expo\.json|package\.json|tsconfig|eslint|prettier|jest\.config|vitest|playwright|detox|maestro|fastfile|appfile|gradlew|podfile|metro\.config|babel\.config)/i;
+    const folders: FolderMap[] = [];
+    for (const [dir, files] of [...byDir.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 25)) {
+      const kinds: Record<string, number> = {};
+      for (const f of files) {
+        const e = extOf(f);
+        kinds[e] = (kinds[e] ?? 0) + 1;
+      }
+      const readmePath = files.find((f) => /read ?me\.md$/i.test(f));
+      const readmeRaw = readmePath ? await readIfPresent(readmePath, 400) : '';
+      folders.push({
+        dir,
+        files: files.length,
+        kinds,
+        notable: files.filter((f) => notablePat.test(f.split('/').pop() ?? '')).slice(0, 8),
+        sample: files.length <= 15 ? files.map((f) => f.split('/').pop() ?? f) : [],
+        readme: readmeRaw.replace(/\s+/g, ' ').trim().slice(0, 400),
+      });
+    }
+
+    const packages: PackageMap[] = [];
+    const pkgDirs = new Set(['', ...facts.rnRoots]);
+    for (const p of all.filter((x) => x.endsWith('/package.json') && !x.includes('node_modules')).slice(0, 12)) {
+      pkgDirs.add(p.slice(0, -'/package.json'.length));
+    }
+    for (const dir of [...pkgDirs].slice(0, 12)) {
+      const raw = await readIfPresent(dir ? `${dir}/package.json` : 'package.json', 4000);
+      if (!raw) continue;
+      try {
+        const pkg = JSON.parse(raw) as { name?: string; description?: string; scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+        const dirFiles = byDir.get(dir || '(root)') ?? [];
+        packages.push({
+          dir: dir || '(root)',
+          name: pkg.name ?? dir,
+          description: (pkg.description ?? '').slice(0, 200),
+          scripts: Object.keys(pkg.scripts ?? {}).slice(0, 12),
+          depCount: Object.keys({ ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }).length,
+          hasReadme: dirFiles.some((f) => /read ?me/i.test(f)),
+          hasTests: dirFiles.some((f) => /(__tests__|__mocks__|\.test\.|\.spec\.|e2e)/i.test(f)),
+        });
+      } catch {
+        // skip unparseable manifests
+      }
+    }
+
+    const entryPoints = all
+      .filter((p) => /(^|\/)(index\.(ts|js|tsx|jsx)|main\.(ts|js)|app\.(ts|tsx|js)|_layout\.tsx|server\.(ts|js)|cli\.(ts|js))$/i.test(p))
+      .slice(0, 15);
+    const docFiles = all.filter((p) => /\.md$/i.test(p) && !p.includes('node_modules')).slice(0, 20);
+    // Doc digest: READMEs + root project docs, the fastest route to "what is this".
+    const docPicks = [
+      ...all.filter((p) => /read ?me\.md$/i.test(p)).slice(0, 4),
+      ...['AGENTS.md', 'replit.md', 'task.md', 'plan.md', 'ARCHITECTURE.md', 'OVERVIEW.md'].filter((d) => inTree.has(d)),
+    ].slice(0, 7);
+    const docs: DocDigest[] = [];
+    for (const d of docPicks) {
+      const raw = await readIfPresent(d, 1500);
+      if (raw) docs.push({ path: d, excerpt: raw.replace(/\s+/g, ' ').trim().slice(0, 1200) });
+    }
+    return { folders, packages, entryPoints, docFiles, docs };
   },
 );
 

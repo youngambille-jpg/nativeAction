@@ -17,7 +17,8 @@
     "@octokit/rest": "^21.0.0",
     "dotenv": "^16.4.5",
     "neatlogs": "^1.1.28",
-    "openai": "^6.34.0"
+    "openai": "^6.34.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
