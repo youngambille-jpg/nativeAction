@@ -1,0 +1,43 @@
+check if entire plugin is anabled
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+i have rerun it, check it
+
+---
+
+save this seesion so i can see it as checkpoint
+
+---
+
+leave it since it now allows the antigravity session ,read C:\Users\osaki\AppData\Local\Temp\session-d47d7ee7-7571-4906-be87-606fcc7dc9e2.md, and write read me and so we can plan submission
+
+---
+
+answer this questions How you used the tools
+A few lines each
+cfo.ai
+How did cfo.ai shape your business plan?
+
+Entire
+How did you use Entire? Add evidence links.
+
+Bonus points
+
+Checkpoints: show progress and key decisions.
+entire-graph: find code or assess risky changes.
+Open-source builds: working features or integrations on Entire’s CLI, Graph or External Agents.
+Add supporting links to your answer.
+
+neatlogs
+What did you trace, debug or improve?
+
+Email verified.
