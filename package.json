@@ -1,0 +1,30 @@
+{
+  "name": "nativeaction",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ActionsForge: React Native Android GitHub Actions fix agent (neatHack, team nativeAction)",
+  "scripts": {
+    "fix": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "doctor:local": "neatlogs doctor --local --json",
+    "doctor:probe": "neatlogs doctor --probe --json"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.296",
+    "@earendil-works/pi-agent-core": "^1.1.0",
+    "@earendil-works/pi-ai": "^1.1.0",
+    "@octokit/rest": "^21.0.0",
+    "dotenv": "^16.4.5",
+    "neatlogs": "^1.1.28",
+    "openai": "^6.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
